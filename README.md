@@ -4,6 +4,27 @@ Download all your kindle books script.
 
 ![image](https://user-images.githubusercontent.com/15976103/172113700-7be0ae1f-1aae-4b50-8377-13047c63411b.png)
 
+## 🍎 Web UI（Mac 専用 / amazon.co.jp / EPUB 出力）
+
+ブラウザから蔵書を選択して DRM 解除済み EPUB を `/Users/makotofalcon/kindle/` に保存するローカル Web アプリを同梱しています（Next.js 16 + FastAPI）。
+物理 Kindle 端末は不要です（`no_kindle.py` 経路を使用）。
+
+```bash
+# 初回セットアップ（Homebrew Python 3.12 推奨、lzma 対応版が必要）
+/opt/homebrew/bin/python3.12 -m venv .venv
+./.venv/bin/pip install -r server/requirements.txt
+(cd web && npm install)
+
+# 起動（FastAPI + Next.js dev をまとめて立ち上げ、ブラウザを開く）
+./dev.sh
+```
+
+- ログイン: メールアドレス + パスワード（2段階認証が有効なアカウントは通過不可）
+- 補助: Chrome / Safari / Firefox / Edge から amazon.co.jp Cookie を自動抽出
+- 出力: `/Users/makotofalcon/kindle/`（`KINDLE_WEB_OUTPUT_DIR` で上書き可）
+
+詳細は [`web/README.md`](web/README.md) を参照。
+
 ## **2024.01 Amazon has shut down the China storefront homepage. You can download your books by visiting this link: https://www.amazon.cn/hz/mycd/myx#/home/content/booksAll/dateDsc/**
 
 ## 2023.06.26 If you don't have a physical Kindle device, you can use the following command. The downloaded EPUB files will be placed in the EPUB folder.

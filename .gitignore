@@ -104,6 +104,18 @@ celerybeat.pid
 
 # Environments
 .env
+# Web アプリ (Next.js)
+web/node_modules/
+web/.next/
+web/.turbo/
+web/next-env.d.ts
+web/tsconfig.tsbuildinfo
+
+# ダウンロード成果物 / 開発ログ
+/Users/makotofalcon/kindle/
+/tmp/kindle-*.log
+/tmp/kindle-*.png
+
 .venv
 env/
 venv/
@@ -143,3 +155,10 @@ DOWNLOADS/
 my_kindle_stats.md
 pdocs_bookmark.json
 ebooks_bookmark.json
+
+# 上位の "lib/" "downloads/" ignore が web/src 配下に波及するのを打ち消す
+# （gitignore は後の行が優先されるので末尾で再包含する）
+!web/src/lib/
+!web/src/lib/**
+!web/src/app/downloads/
+!web/src/app/downloads/**
