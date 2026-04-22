@@ -29,6 +29,7 @@ from playwright.async_api import (
 )
 
 from . import settings
+from .schemas import BookItem
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,84 @@ class CaptureService:
                 ],
             )
             return self._ctx
+
+    async def fetch_library(self) -> list[BookItem]:
+        """Cloud Reader の kindle-library ページから蔵書一覧をスクレイプする。
+
+        ページ上の DOM は頻繁に変わる可能性があるため、以下の手順で頑健に取得する:
+          1. library ページを開く
+          2. `asin` 属性や data-asin を持つ要素を全て列挙（カード/ボタンのどちらでも）
+          3. タイトルは同カード内の aria-label または子要素 text から推定
+          4. 遅延ロード対策として PageDown でスクロールしながら繰り返し走査
+        """
+        ctx = await self._ensure_context()
+        page = await ctx.new_page()
+        try:
+            await page.goto(
+                "https://read.amazon.co.jp/kindle-library",
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            # library grid が出るまで待つ
+            try:
+                await page.wait_for_selector(
+                    "[data-asin], [id^='cover-image-']", timeout=30_000
+                )
+            except PWTimeoutError:
+                raise RuntimeError(
+                    "蔵書ページの描画待ちでタイムアウト。Cloud Reader にログインしていますか？"
+                )
+
+            # 全件ロードのためスクロールして書籍数が増えなくなるまで繰り返す
+            seen = 0
+            stale = 0
+            for _ in range(60):
+                count = await page.evaluate(
+                    "() => document.querySelectorAll('[data-asin]').length"
+                )
+                if count == seen:
+                    stale += 1
+                    if stale >= 3:
+                        break
+                else:
+                    stale = 0
+                    seen = count
+                await page.keyboard.press("End")
+                await asyncio.sleep(0.6)
+
+            raw = await page.evaluate(
+                """() => {
+                    const items = [];
+                    document.querySelectorAll('[data-asin]').forEach(el => {
+                        const asin = el.getAttribute('data-asin');
+                        if (!asin) return;
+                        // タイトルの候補を複数試す
+                        const aria = el.getAttribute('aria-label')
+                            || el.querySelector('[aria-label]')?.getAttribute('aria-label')
+                            || '';
+                        const titleEl = el.querySelector('[class*=title i], [data-testid*=title i]');
+                        const alt = el.querySelector('img')?.getAttribute('alt') || '';
+                        const title = (titleEl?.textContent || aria || alt || '').trim();
+                        items.push({ asin, title });
+                    });
+                    // 重複排除 (asin で)
+                    const seen = new Set();
+                    return items.filter(i => {
+                        if (seen.has(i.asin)) return false;
+                        seen.add(i.asin);
+                        return true;
+                    });
+                }"""
+            )
+            return [
+                BookItem(
+                    asin=str(item["asin"]),
+                    title=str(item.get("title") or item["asin"]),
+                )
+                for item in raw
+            ]
+        finally:
+            await page.close()
 
     async def ensure_login(self) -> dict[str, bool | str]:
         """Cloud Reader を開き、ログイン済みなら `authenticated=True` を返す。

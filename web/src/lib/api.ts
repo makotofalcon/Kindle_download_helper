@@ -3,42 +3,23 @@
  * `next.config.ts` の rewrites によって `/api/*` がバックエンドへフォワードされる前提。
  */
 
-export type AuthStatus = {
+export interface AuthStatus {
   authenticated: boolean;
-  mode: "nokindle" | "cookie" | null;
-  email_hash: string | null;
-  domain: string | null;
-  device_sn_tail: string | null;
-};
+  message: string | null;
+}
 
-export type BookItem = {
+export interface BookItem {
   asin: string;
   title: string;
   authors: string;
   acquired_at: string | null;
   content_type: string | null;
-};
+}
 
-export type BookList = {
+export interface BookList {
   books: BookItem[];
   fetched_at: string;
-};
-
-export type BrowserName = "chrome" | "safari" | "firefox" | "edge";
-
-export type KindleDevice = {
-  deviceSerialNumber: string;
-  deviceType: string;
-  deviceName: string;
-  deviceAccountId: string;
-};
-
-export type BrowserCookieResult = {
-  browser: BrowserName;
-  domain: string;
-  count: number;
-  has_session_id: boolean;
-};
+}
 
 export type DownloadStatus =
   | "queued"
@@ -47,13 +28,13 @@ export type DownloadStatus =
   | "failed"
   | "skipped";
 
-export type DownloadProgress = {
+export interface DownloadProgress {
   asin: string;
   title: string;
   status: DownloadStatus;
   message: string | null;
   output_path: string | null;
-};
+}
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -73,7 +54,6 @@ async function jsonFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
   });
   if (!res.ok) {
-    // FastAPI の detail + amazon_response を取り出せるようにする
     let body: unknown = null;
     let message = res.statusText;
     try {
@@ -90,46 +70,21 @@ async function jsonFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
-  authStatus: () => jsonFetch<AuthStatus>("/api/auth/status"),
-  login: (email: string, password: string, otp_code?: string) =>
-    jsonFetch<AuthStatus>("/api/auth/login", {
-      method: "POST",
-      headers: jsonHeaders,
-      body: JSON.stringify({
-        email,
-        password,
-        otp_code: otp_code?.trim() || null,
-      }),
-    }),
-  cookieLogin: (browser: BrowserName, device_sn: string) =>
-    jsonFetch<AuthStatus>("/api/auth/cookie-login", {
-      method: "POST",
-      headers: jsonHeaders,
-      body: JSON.stringify({ browser, device_sn }),
-    }),
-  listDevices: () =>
-    jsonFetch<{ devices: KindleDevice[] }>("/api/kindle/devices"),
-  logout: () =>
+  authStatus: (): Promise<AuthStatus> => jsonFetch<AuthStatus>("/api/auth/status"),
+  logout: (): Promise<{ ok: boolean }> =>
     jsonFetch<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
-  restore: () =>
-    jsonFetch<AuthStatus>("/api/auth/restore", { method: "POST" }),
-  extractCookies: (browser: BrowserName) =>
-    jsonFetch<BrowserCookieResult>(`/api/cookies/${browser}`, {
-      method: "POST",
-    }),
-  books: (refresh = false) =>
+  captureEnsureLogin: (): Promise<AuthStatus> =>
+    jsonFetch<AuthStatus>("/api/capture/ensure-login", { method: "POST" }),
+  books: (refresh = false): Promise<BookList> =>
     jsonFetch<BookList>(`/api/books${refresh ? "?refresh=true" : ""}`),
-  startDownload: (asins: string[]) =>
+  startDownload: (
+    asins: string[],
+  ): Promise<{ ok: boolean; total: number }> =>
     jsonFetch<{ ok: boolean; total: number }>("/api/downloads", {
       method: "POST",
       headers: jsonHeaders,
       body: JSON.stringify({ asins }),
     }),
-  revealOutput: () =>
+  revealOutput: (): Promise<{ path: string }> =>
     jsonFetch<{ path: string }>("/api/output/reveal"),
-  captureEnsureLogin: () =>
-    jsonFetch<{ authenticated: boolean; message: string }>(
-      "/api/capture/ensure-login",
-      { method: "POST" },
-    ),
 };

@@ -1,4 +1,3 @@
-import Link from "next/link";
 import { LibraryTable } from "@/components/LibraryTable";
 import type { AuthStatus, BookList } from "@/lib/api";
 
@@ -10,17 +9,14 @@ async function fetchAuth(): Promise<AuthStatus> {
     if (!res.ok) throw new Error(String(res.status));
     return (await res.json()) as AuthStatus;
   } catch {
-    return {
-      authenticated: false,
-      mode: null,
-      email_hash: null,
-      domain: null,
-      device_sn_tail: null,
-    };
+    return { authenticated: false, message: null };
   }
 }
 
-async function fetchBooks(): Promise<{ data: BookList | null; error: string | null }> {
+async function fetchBooks(): Promise<{
+  data: BookList | null;
+  error: string | null;
+}> {
   try {
     const res = await fetch(`${ORIGIN}/api/books`, { cache: "no-store" });
     if (!res.ok) {
@@ -43,12 +39,10 @@ export default async function LibraryPage() {
   if (!auth.authenticated) {
     return (
       <div className="card stack">
-        <div>まだログインしていません。</div>
-        <div>
-          <Link href="/" className="inline-code">
-            トップ
-          </Link>{" "}
-          からログインしてください。
+        <div className="error">Cloud Reader にログインしていません。</div>
+        <div className="muted">
+          トップページの「ログイン確認 / ブラウザを開く」から amazon.co.jp に
+          ログインしてください。
         </div>
       </div>
     );
@@ -59,7 +53,9 @@ export default async function LibraryPage() {
     return (
       <div className="card stack">
         <div className="error">蔵書取得に失敗しました。</div>
-        <pre className="muted" style={{ whiteSpace: "pre-wrap" }}>{error}</pre>
+        <pre className="muted" style={{ whiteSpace: "pre-wrap" }}>
+          {error}
+        </pre>
       </div>
     );
   }

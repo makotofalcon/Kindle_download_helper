@@ -1,13 +1,10 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { ApiError, api } from "@/lib/api";
+import { ApiError, api, type AuthStatus } from "@/lib/api";
 
 export function CloudReaderLogin() {
-  const [state, setState] = useState<{
-    authenticated: boolean;
-    message: string;
-  } | null>(null);
+  const [state, setState] = useState<AuthStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 

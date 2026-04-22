@@ -8,7 +8,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
-from . import active
 from .capture_service import service as capture_service
 from .schemas import DownloadProgress
 
