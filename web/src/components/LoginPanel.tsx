@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { api, type AuthStatus } from "@/lib/api";
+import { ApiError, api, type AuthStatus } from "@/lib/api";
 
 type Props = { initial: AuthStatus };
 
@@ -11,21 +11,30 @@ export function LoginPanel({ initial }: Props) {
   const [status, setStatus] = useState<AuthStatus>(initial);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [otpCode, setOtpCode] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [rawAmazon, setRawAmazon] = useState<unknown>(null);
   const [pending, startTransition] = useTransition();
 
   const onLogin = (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setRawAmazon(null);
     startTransition(async () => {
       try {
-        const next = await api.login(email, password);
+        const next = await api.login(email, password, otpCode);
         setStatus(next);
         setPassword("");
+        setOtpCode("");
         router.refresh();
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        setError(message);
+        if (err instanceof ApiError) {
+          setError(err.message);
+          const body = err.body as { amazon_response?: unknown } | null;
+          setRawAmazon(body?.amazon_response ?? null);
+        } else {
+          setError(err instanceof Error ? err.message : String(err));
+        }
       }
     });
   };
@@ -33,18 +42,28 @@ export function LoginPanel({ initial }: Props) {
   const onLogout = () => {
     startTransition(async () => {
       await api.logout();
-      setStatus({ authenticated: false, email_hash: null, domain: null });
+      setStatus({
+        authenticated: false,
+        mode: null,
+        email_hash: null,
+        domain: null,
+        device_sn_tail: null,
+      });
       router.refresh();
     });
   };
 
   if (status.authenticated) {
+    const modeLabel =
+      status.mode === "cookie"
+        ? `Cookie+DSN (…${status.device_sn_tail ?? "????"})`
+        : `email/password (id:${status.email_hash ?? "-"})`;
     return (
       <div className="card">
         <div className="row" style={{ justifyContent: "space-between" }}>
           <div className="stack">
             <div className="success">
-              ログイン済み（amazon.{status.domain}・id:{status.email_hash}）
+              ログイン済み（amazon.{status.domain ?? "co.jp"} / {modeLabel}）
             </div>
             <div className="muted">
               蔵書タブで本を選んでダウンロードできます。
@@ -81,6 +100,20 @@ export function LoginPanel({ initial }: Props) {
             required
           />
         </label>
+        <label>
+          <div className="muted">
+            2段階認証コード <span style={{ fontSize: 11 }}>(OTPが有効な場合のみ・6桁)</span>
+          </div>
+          <input
+            type="text"
+            value={otpCode}
+            onChange={(e) => setOtpCode(e.target.value.replace(/[^0-9]/g, "").slice(0, 6))}
+            inputMode="numeric"
+            autoComplete="one-time-code"
+            placeholder="例: 123456"
+            maxLength={6}
+          />
+        </label>
       </div>
 
       <div className="row" style={{ justifyContent: "space-between" }}>
@@ -94,10 +127,30 @@ export function LoginPanel({ initial }: Props) {
       </div>
 
       {error && <div className="error">{error}</div>}
+      {rawAmazon !== null && (
+        <details>
+          <summary className="muted" style={{ cursor: "pointer" }}>
+            Amazon の生レスポンスを表示（診断用）
+          </summary>
+          <pre
+            style={{
+              marginTop: 8,
+              padding: 10,
+              background: "var(--surface-2)",
+              borderRadius: 6,
+              maxHeight: 300,
+              overflow: "auto",
+              fontSize: 11,
+            }}
+          >
+            {JSON.stringify(rawAmazon, null, 2)}
+          </pre>
+        </details>
+      )}
 
       <div className="warning">
-        2段階認証(OTP)が有効なアカウントは、この経路では通過できません。
-        その場合は Amazon 側で一時的に無効化するか、端末認証済みの状態を別途ご用意ください。
+        2段階認証(OTP)が有効なアカウントは、認証アプリ/SMSの6桁コードを上のOTP欄に入れてください。
+        サーバ側で <span className="inline-code">password + otp_code</span> を連結して Amazon の register API に送ります。
       </div>
     </form>
   );

@@ -97,8 +97,9 @@ export function LibraryTable({ books }: Props) {
             className="primary"
             disabled={pending || selected.size === 0}
             onClick={startDownload}
+            title="Kindle Cloud Reader を Playwright で開いてページ毎にキャプチャ→PDFを生成します"
           >
-            {pending ? "開始中..." : "選択したものをダウンロード"}
+            {pending ? "開始中..." : "選択した本を PDF キャプチャ"}
           </button>
         </div>
       </div>

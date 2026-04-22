@@ -1,4 +1,4 @@
-"""ダウンロードキューと SSE 進捗ストリーム。"""
+"""キャプチャ（Kindle Cloud Reader → PDF）ジョブの管理と SSE 進捗ストリーム。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
-from .kindle_service import service
+from . import active
+from .capture_service import service as capture_service
 from .schemas import DownloadProgress
 
 logger = logging.getLogger(__name__)
@@ -16,23 +17,24 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Job:
-    asins: list[str]
+    # (asin, title) のタプルで受け取って、キャプチャ時にタイトルをファイル名に使う
+    items: list[tuple[str, str]]
     queue: asyncio.Queue[DownloadProgress | None] = field(default_factory=asyncio.Queue)
     done: bool = False
 
 
 class DownloadManager:
-    """同時実行は 1 ジョブ。Amazon 側のリスク管理を避けるためシリアル処理。"""
+    """同時実行は 1 ジョブ。Kindle Cloud Reader を 1 枚ずつスクショするためシリアル処理。"""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._current: Job | None = None
 
-    async def start(self, asins: list[str]) -> Job:
+    async def start(self, items: list[tuple[str, str]]) -> Job:
         async with self._lock:
             if self._current and not self._current.done:
-                raise RuntimeError("すでに別のダウンロードが進行中です。")
-            job = Job(asins=list(asins))
+                raise RuntimeError("すでに別のジョブが進行中です。")
+            job = Job(items=list(items))
             self._current = job
 
         asyncio.create_task(self._run(job))
@@ -40,24 +42,50 @@ class DownloadManager:
 
     async def _run(self, job: Job) -> None:
         try:
-            for asin in job.asins:
-                await job.queue.put(
-                    DownloadProgress(asin=asin, title=asin, status="running")
-                )
-                result = await asyncio.to_thread(service.download_one, asin)
+            for asin, title in job.items:
                 await job.queue.put(
                     DownloadProgress(
-                        asin=result.asin,
-                        title=result.title,
-                        status="success" if result.ok else "failed",
-                        message=result.message,
-                        output_path=result.output_path,
+                        asin=asin, title=title, status="running", message="開始中"
                     )
                 )
-                # Amazon 側のリスク制御を避けるための軽いディレイ
-                await asyncio.sleep(1.5)
+                try:
+                    async for ev in capture_service.capture_book(asin, title):
+                        # Playwright 層のイベントを UI 用の DownloadProgress に翻訳
+                        if ev.status == "capturing":
+                            msg = f"キャプチャ中: {ev.page} ページ目"
+                            ui_status = "running"
+                        elif ev.status == "writing_pdf":
+                            msg = f"PDF 作成中 ({ev.total}ページ)"
+                            ui_status = "running"
+                        elif ev.status == "done":
+                            msg = f"完了 ({ev.total}ページ)"
+                            ui_status = "success"
+                        elif ev.status == "failed":
+                            msg = ev.message or "失敗"
+                            ui_status = "failed"
+                        else:
+                            msg = ev.status
+                            ui_status = "running"
+                        await job.queue.put(
+                            DownloadProgress(
+                                asin=ev.asin,
+                                title=ev.title,
+                                status=ui_status,
+                                message=msg,
+                                output_path=ev.output_path,
+                            )
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("capture failed asin=%s", asin)
+                    await job.queue.put(
+                        DownloadProgress(
+                            asin=asin, title=title, status="failed", message=str(exc)
+                        )
+                    )
+                # 連続キャプチャ時のクールダウン
+                await asyncio.sleep(1.0)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("download job error")
+            logger.exception("job error")
             await job.queue.put(
                 DownloadProgress(
                     asin="-",

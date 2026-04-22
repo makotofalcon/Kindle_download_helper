@@ -11,18 +11,41 @@ DownloadStatus = Literal["queued", "running", "success", "failed", "skipped"]
 
 
 class LoginRequest(BaseModel):
-    """Amazon アカウントへのログインリクエスト。"""
+    """Amazon アカウントへのログインリクエスト（email/password 経路）。"""
 
     email: str = Field(..., description="amazon.co.jp のメールアドレス")
     password: str = Field(..., description="amazon.co.jp のパスワード")
+    otp_code: Optional[str] = Field(
+        default=None,
+        description="2段階認証が有効な場合の6桁コード。指定時はpasswordの末尾に連結される。",
+    )
+
+
+class CookieLoginRequest(BaseModel):
+    """ブラウザCookie + 端末シリアルによるログインリクエスト（kindle.py 経路）。
+
+    amazon.co.jp に既にログイン済みのブラウザから Cookie を抽出し、指定された DSN
+    (端末シリアル番号) を使って蔵書取得・ダウンロード・DRM解除を行う。
+    """
+
+    browser: Literal["chrome", "safari", "firefox", "edge"] = Field(
+        default="chrome", description="Cookie 抽出対象ブラウザ"
+    )
+    device_sn: str = Field(
+        ..., description="Amazon に登録済みの Kindle 端末シリアル番号 (DSN)"
+    )
 
 
 class AuthStatus(BaseModel):
     """現在の認証状態。"""
 
     authenticated: bool
+    mode: Optional[Literal["nokindle", "cookie"]] = None
     email_hash: Optional[str] = None
     domain: Optional[str] = None
+    device_sn_tail: Optional[str] = Field(
+        default=None, description="cookie モード時、DSN 末尾4文字だけ返す（確認用）"
+    )
 
 
 class BookItem(BaseModel):

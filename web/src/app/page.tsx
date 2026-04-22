@@ -1,5 +1,6 @@
 import { LoginPanel } from "@/components/LoginPanel";
-import { BrowserCookiePanel } from "@/components/BrowserCookiePanel";
+import { CookieLoginPanel } from "@/components/CookieLoginPanel";
+import { LoginTabs } from "@/components/LoginTabs";
 import type { AuthStatus } from "@/lib/api";
 
 async function fetchAuthStatus(): Promise<AuthStatus> {
@@ -10,16 +11,21 @@ async function fetchAuthStatus(): Promise<AuthStatus> {
     if (!res.ok) throw new Error(String(res.status));
     return (await res.json()) as AuthStatus;
   } catch {
-    return { authenticated: false, email_hash: null, domain: null };
+    return {
+      authenticated: false,
+      mode: null,
+      email_hash: null,
+      domain: null,
+      device_sn_tail: null,
+    };
   }
 }
 
 export default async function Page() {
   const status = await fetchAuthStatus();
-  return (
-    <>
-      <LoginPanel initial={status} />
-      <BrowserCookiePanel />
-    </>
-  );
+  if (status.authenticated) {
+    // ログイン済みなら LoginPanel がログアウトボタン付きの success カードを描画
+    return <LoginPanel initial={status} />;
+  }
+  return <LoginTabs initial={status} />;
 }

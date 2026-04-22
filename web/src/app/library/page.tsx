@@ -10,7 +10,13 @@ async function fetchAuth(): Promise<AuthStatus> {
     if (!res.ok) throw new Error(String(res.status));
     return (await res.json()) as AuthStatus;
   } catch {
-    return { authenticated: false, email_hash: null, domain: null };
+    return {
+      authenticated: false,
+      mode: null,
+      email_hash: null,
+      domain: null,
+      device_sn_tail: null,
+    };
   }
 }
 

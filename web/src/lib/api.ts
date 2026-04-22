@@ -5,8 +5,10 @@
 
 export type AuthStatus = {
   authenticated: boolean;
+  mode: "nokindle" | "cookie" | null;
   email_hash: string | null;
   domain: string | null;
+  device_sn_tail: string | null;
 };
 
 export type BookItem = {
@@ -23,6 +25,13 @@ export type BookList = {
 };
 
 export type BrowserName = "chrome" | "safari" | "firefox" | "edge";
+
+export type KindleDevice = {
+  deviceSerialNumber: string;
+  deviceType: string;
+  deviceName: string;
+  deviceAccountId: string;
+};
 
 export type BrowserCookieResult = {
   browser: BrowserName;
@@ -48,26 +57,58 @@ export type DownloadProgress = {
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
+export class ApiError extends Error {
+  status: number;
+  body: unknown;
+  constructor(status: number, message: string, body: unknown) {
+    super(message);
+    this.status = status;
+    this.body = body;
+  }
+}
+
 async function jsonFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(path, {
     cache: "no-store",
     ...init,
   });
   if (!res.ok) {
-    const msg = await res.text().catch(() => res.statusText);
-    throw new Error(msg || `${res.status}`);
+    // FastAPI の detail + amazon_response を取り出せるようにする
+    let body: unknown = null;
+    let message = res.statusText;
+    try {
+      body = await res.clone().json();
+      if (body && typeof body === "object" && "detail" in body) {
+        message = String((body as { detail: unknown }).detail);
+      }
+    } catch {
+      message = await res.text().catch(() => res.statusText);
+    }
+    throw new ApiError(res.status, message || `${res.status}`, body);
   }
   return (await res.json()) as T;
 }
 
 export const api = {
   authStatus: () => jsonFetch<AuthStatus>("/api/auth/status"),
-  login: (email: string, password: string) =>
+  login: (email: string, password: string, otp_code?: string) =>
     jsonFetch<AuthStatus>("/api/auth/login", {
       method: "POST",
       headers: jsonHeaders,
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({
+        email,
+        password,
+        otp_code: otp_code?.trim() || null,
+      }),
     }),
+  cookieLogin: (browser: BrowserName, device_sn: string) =>
+    jsonFetch<AuthStatus>("/api/auth/cookie-login", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ browser, device_sn }),
+    }),
+  listDevices: () =>
+    jsonFetch<{ devices: KindleDevice[] }>("/api/kindle/devices"),
   logout: () =>
     jsonFetch<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
   restore: () =>
@@ -86,4 +127,9 @@ export const api = {
     }),
   revealOutput: () =>
     jsonFetch<{ path: string }>("/api/output/reveal"),
+  captureEnsureLogin: () =>
+    jsonFetch<{ authenticated: boolean; message: string }>(
+      "/api/capture/ensure-login",
+      { method: "POST" },
+    ),
 };

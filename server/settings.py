@@ -20,6 +20,9 @@ OUTPUT_DIR: Path = _resolve_output_dir()
 STATE_DIR: Path = Path(os.environ.get("KINDLE_WEB_STATE_DIR", str(Path.home() / ".kindle-web")))
 SESSION_FILE: Path = STATE_DIR / "session.json"
 BOOKS_CACHE_FILE: Path = STATE_DIR / "books.json"
+# Playwright 用の永続プロファイル。Kindle Cloud Reader は一度ログインすれば
+# このプロファイル内の Cookie/localStorage で以降もログイン済み扱いされる。
+CHROME_PROFILE_DIR: Path = STATE_DIR / "chrome-profile"
 
 # amazon.co.jp 固定運用
 AMAZON_DOMAIN: str = "co.jp"

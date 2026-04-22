@@ -22,6 +22,7 @@ from kindle_download_helper import amazon_api
 from kindle_download_helper.no_kindle import NoKindle
 
 from . import settings
+from .amazon_login import LoginError, login as amazon_register_login
 from .schemas import AuthStatus, BookItem
 
 logger = logging.getLogger(__name__)
@@ -48,17 +49,30 @@ class KindleService:
         settings.ensure_dirs()
 
     # --------- 認証 ---------
-    def login(self, email: str, password: str) -> AuthStatus:
+    def login(self, email: str, password: str, otp_code: Optional[str] = None) -> AuthStatus:
+        """自前実装の /auth/register 経路でログイン。
+
+        失敗時は Amazon の生レスポンスを `LoginError.raw_response` に含めて投げる。
+        呼び出し元（FastAPI ハンドラ）はこれを UI に返すことで、OTP 以外にどんな
+        challenge が要求されているか・エラーコードは何かを切り分けられる。
+        """
         with self._lock:
             settings.ensure_dirs()
-            # NoKindle は DEFAULT_OUT_DIR / DEFAULT_OUT_EPUB_DIR 配下に出力するが、
-            # 我々は /Users/makotofalcon/kindle 配下に集めたいので直接指定する。
+            # 先に /auth/register で必要なトークンを取って保存しておく。
+            amazon_register_login(
+                email=email,
+                password=password,
+                domain=settings.AMAZON_DOMAIN,
+                otp_code=(otp_code.strip() if otp_code else None) or None,
+            )
+
+            # 保存済みトークンをベースに NoKindle を立ち上げる（refresh 経路で通る）。
             out_dir = settings.OUTPUT_DIR / "DOWNLOADS"
             out_dedrm_dir = settings.OUTPUT_DIR / "DEDRMS"
             out_epub_dir = settings.OUTPUT_DIR
             client = NoKindle(
                 email=email,
-                password=password,
+                password="__already_registered__",
                 domain=settings.AMAZON_DOMAIN,
                 out_dir=str(out_dir),
                 out_dedrm_dir=str(out_dedrm_dir),
@@ -66,8 +80,7 @@ class KindleService:
             )
             if not getattr(client, "tokens", None):
                 raise RuntimeError(
-                    "Amazon へのログインに失敗しました。メール/パスワードを確認してください。"
-                    "2段階認証が有効な場合、この方式では通過できません。"
+                    "トークンの保存には成功しましたが NoKindle の初期化に失敗しました。"
                 )
             self._client = client
             self._email = email
