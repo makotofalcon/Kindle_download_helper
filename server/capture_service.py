@@ -47,9 +47,9 @@ _END_REPEAT_THRESHOLD = 3
 # キャプチャ領域: 画面上下の UI chrome (Kindle Library ボタン / Location バー) を除外
 _CROP_TOP = 50
 _CROP_BOTTOM_MARGIN = 50
-# 左右のナビ矢印ボタン (kr-chevron-*) は幅 48 の円ボタン。これを確実に除外するため
-# 左右それぞれ 110px の余白を取り除く。
-_CROP_SIDE = 110
+# 左右のナビ矢印ボタン (kr-chevron-*) は x=46-94 (prev) / x=1306-1354 (next) に固定
+# で width=48。余裕をみて 98px だけ除外すると、本文は幅広く保ちつつ矢印を確実に排除できる。
+_CROP_SIDE = 98
 _VIEWPORT_W = 1400
 _VIEWPORT_H = 1800
 
@@ -254,6 +254,26 @@ class CaptureService:
             # `opacity:0` でも chrome 自体の click 判定は残るためキャプチャに写らない工夫が必要。
             # → ナビ矢印は画面端に固定されているので、`clip` で左右マージンを除外する方式に切替。
 
+            # Kindle Cloud Reader は初回オープン時に "Most Recent Page Read" ダイアログ
+            # （別端末で進めた位置へ飛ぶか？）を表示することがある。これを閉じないと
+            # 全てのクリックがダイアログに吸われて次ページに進めない。No を押す。
+            # 念のため他の似たダイアログも閉じる。
+            for _ in range(3):
+                closed = False
+                try:
+                    dialog = page.locator(
+                        'ion-alert .alert-button:has-text("No")'
+                    ).first
+                    if await dialog.count() > 0 and await dialog.is_visible():
+                        await dialog.click(timeout=2_000)
+                        logger.info("dismissed 'Most Recent Page Read' dialog")
+                        closed = True
+                except Exception:  # noqa: BLE001
+                    pass
+                if not closed:
+                    break
+                await asyncio.sleep(1.0)
+
             # 本文エリアだけをキャプチャする clip（上下バーとナビ矢印を除外）
             clip = {
                 "x": _CROP_SIDE,
@@ -320,17 +340,24 @@ class CaptureService:
                     return ""
 
             async def wait_location_change(
-                prev: str, timeout_sec: float = 12.0
+                prev: str, timeout_sec: float = 30.0
             ) -> tuple[bool, str]:
-                """location が prev 以外になるまで待つ。(changed, new_location) を返す。"""
+                """location が prev 以外の「非空な値」になるまで待つ。
+                遷移中に `.footer-label.position` が一時的に DOM から消えて
+                `''` を返すことがあるが、それはタイムアウトに数えず polling を継続する。
+                """
                 deadline = asyncio.get_event_loop().time() + timeout_sec
-                curr = prev
+                last_non_empty = prev
                 while asyncio.get_event_loop().time() < deadline:
                     await asyncio.sleep(0.3)
                     curr = await get_location()
-                    if curr and curr != prev:
+                    if not curr:
+                        # 遷移中の一時的消失。無視して再ポーリング。
+                        continue
+                    if curr != prev:
                         return True, curr
-                return False, curr
+                    last_non_empty = curr
+                return False, last_non_empty
 
             async def capture_stable() -> tuple[bytes, str]:
                 """現在の画面が変化しなくなるまで待ち、安定したスクショを返す。"""
@@ -363,41 +390,65 @@ class CaptureService:
             prev_location = await get_location()
             logger.info("location after rewind=%r", prev_location)
 
-            first_png, _ = await capture_stable()
+            first_png, first_hash = await capture_stable()
             images: list[Image.Image] = [
                 Image.open(io.BytesIO(first_png)).convert("RGB")
             ]
+            prev_hash = first_hash
             yield PageEvent(
                 asin=asin, title=title, page=1, total=None, status="capturing"
             )
 
+            # 終端判定: 「Location も hash も変わらない」が連続すれば終わり。
+            # `.footer-label.position` はページ遷移中に一時的に空になるため、Location
+            # だけでは誤検知しやすい。本が重いと Location 表示の反映が遅いので、
+            # hash 変化も併用することで確実にページ送りを検出する。
+            still_count = 0
             for i in range(2, _MAX_PAGES + 1):
                 ok = await click_next_page()
                 if not ok:
                     logger.info("click_next_page failed; treating as end of book")
                     break
-                # Location が変わるまで待つ（=ローディングじゃなく本当に新しいページ）
-                changed, new_location = await wait_location_change(
-                    prev_location, timeout_sec=12.0
+
+                changed_loc, new_location = await wait_location_change(
+                    prev_location, timeout_sec=10.0
                 )
-                if not changed:
+                # いずれにせよ hash 安定化を待つ（本が重い本では Location 反映より
+                # 画面描画の方が早く終わるケースがある）
+                png, new_hash = await capture_stable()
+
+                if changed_loc and new_location:
+                    # Location が明らかに変わった = 新ページ確定
+                    advance_reason = f"loc {prev_location!r}->{new_location!r}"
+                    prev_location = new_location
+                elif new_hash != prev_hash:
+                    # Location 表示は追随してないが、画面は描画し直されている。
+                    # → 新ページと見なす
+                    advance_reason = f"hash changed ({prev_hash[:8]}->{new_hash[:8]}) while loc stayed"
+                else:
+                    # どちらも変わらず
+                    still_count += 1
                     logger.info(
-                        "Location unchanged after click (prev=%r new=%r); end of book",
-                        prev_location,
+                        "page did not advance (loc=%r hash unchanged, still_count=%d)",
                         new_location,
+                        still_count,
                     )
-                    break
-                # Location は進んだが描画がまだの可能性があるのでハッシュ安定化
-                png, _ = await capture_stable()
+                    if still_count >= _END_REPEAT_THRESHOLD:
+                        logger.info("end of book detected")
+                        break
+                    continue
+
+                still_count = 0
+                prev_hash = new_hash
                 images.append(Image.open(io.BytesIO(png)).convert("RGB"))
-                prev_location = new_location
+                logger.info("captured page %d (%s)", len(images), advance_reason)
                 yield PageEvent(
                     asin=asin,
                     title=title,
                     page=len(images),
                     total=None,
                     status="capturing",
-                    message=new_location,
+                    message=advance_reason,
                 )
 
             if not images:
