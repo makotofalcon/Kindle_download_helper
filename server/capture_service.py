@@ -35,10 +35,24 @@ logger = logging.getLogger(__name__)
 
 # 1 冊で想定される最大ページ数（暴走防止）
 _MAX_PAGES = 3000
-# ページ送り後、描画安定を待つ時間（秒）
-_PAGE_SETTLE_SEC = 0.9
-# 終端判定: 連続して同一ハッシュが続いたら終わり
+# ハッシュ安定化の 1 サンプルあたりの待ち時間（秒）
+_POLL_INTERVAL_SEC = 0.3
+# 連続して同ハッシュが続いたら "描画安定" と判定する回数
+_STABLE_SAMPLES = 4
+# 安定化待ちの最大試行数（実時間 = これ * POLL_INTERVAL_SEC）
+_MAX_STABLE_POLLS = 40  # 12 秒上限
+# "終端" 判定: 同じ安定ハッシュが続いた回数（ArrowRight でも変化しなかった）
 _END_REPEAT_THRESHOLD = 3
+
+# キャプチャ領域: 画面上下の UI chrome (Kindle Library ボタン / Location バー) を除外
+_CROP_TOP = 50
+_CROP_BOTTOM_MARGIN = 50
+# 左右のナビ矢印ボタン (kr-chevron-*) は幅 48 の円ボタン。これを確実に除外するため
+# 左右それぞれ 110px の余白を取り除く。
+_CROP_SIDE = 110
+_VIEWPORT_W = 1400
+_VIEWPORT_H = 1800
+
 
 
 @dataclass
@@ -221,48 +235,170 @@ class CaptureService:
 
         page: Optional[Page] = None
         try:
+            logger.info("capture_book: open reader asin=%s title=%s", asin, title)
             page = await ctx.new_page()
-            # 本ごとのリーダー URL を直接開く
             await page.goto(
                 f"https://read.amazon.co.jp/?asin={asin}",
                 wait_until="domcontentloaded",
                 timeout=90_000,
             )
-            # 「本文が表示された」目安: body が現れ、読み込み中インジケータが消える
-            await page.wait_for_load_state("networkidle", timeout=60_000)
+            logger.info("capture_book: page loaded, url=%s", page.url)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=60_000)
+            except PWTimeoutError:
+                logger.warning("networkidle timeout (続行)")
             await asyncio.sleep(2.0)
 
-            # クリックしてフォーカスを本文に（キーボード送りを有効化するため）
-            try:
-                await page.click("body")
-            except Exception:  # noqa: BLE001
-                pass
+            # UI chrome（ナビ矢印・ブックマーク・進捗バー等）は意図的に非表示化しない。
+            # `display:none`/`visibility:hidden` すると React の onClick が届かず、
+            # `opacity:0` でも chrome 自体の click 判定は残るためキャプチャに写らない工夫が必要。
+            # → ナビ矢印は画面端に固定されているので、`clip` で左右マージンを除外する方式に切替。
 
-            images: list[Image.Image] = []
-            prev_hash: Optional[str] = None
-            repeat = 0
-            for i in range(1, _MAX_PAGES + 1):
-                await asyncio.sleep(_PAGE_SETTLE_SEC)
-                png_bytes = await page.screenshot(type="png", full_page=False)
-                h = hashlib.md5(png_bytes).hexdigest()
-                if h == prev_hash:
-                    repeat += 1
-                    if repeat >= _END_REPEAT_THRESHOLD:
-                        # 連続で同じ画面 → 終端
+            # 本文エリアだけをキャプチャする clip（上下バーとナビ矢印を除外）
+            clip = {
+                "x": _CROP_SIDE,
+                "y": _CROP_TOP,
+                "width": _VIEWPORT_W - 2 * _CROP_SIDE,
+                "height": _VIEWPORT_H - _CROP_TOP - _CROP_BOTTOM_MARGIN,
+            }
+
+            async def click_next_page() -> bool:
+                """Playwright の実クリックで `aria-label="Next page"` ボタンを押す。
+                React の onClick は native click event で発火するので Playwright の
+                mouse pointer 経由クリックが確実。ボタンが消えていればタイムアウトして False。
+                """
+                try:
+                    await page.locator(
+                        'button[aria-label="Next page"]'
+                    ).first.click(timeout=5_000)
+                    return True
+                except Exception:  # noqa: BLE001
+                    return False
+
+            async def click_prev_page() -> bool:
+                try:
+                    await page.locator(
+                        'button[aria-label="Previous page"]'
+                    ).first.click(timeout=5_000)
+                    return True
+                except Exception:  # noqa: BLE001
+                    return False
+
+            async def go_to_start(max_clicks: int = 600) -> None:
+                """Previous page ボタンを連打して先頭まで戻る。Location が変化しなくなったら終了。"""
+                last_loc = ""
+                stale = 0
+                for idx in range(max_clicks):
+                    ok = await click_prev_page()
+                    if not ok:
                         break
-                else:
-                    repeat = 0
-                    prev_hash = h
-                    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-                    images.append(img)
-                    yield PageEvent(
-                        asin=asin,
-                        title=title,
-                        page=len(images),
-                        total=None,
-                        status="capturing",
+                    await asyncio.sleep(0.25)
+                    curr = await get_location()
+                    if curr == last_loc:
+                        stale += 1
+                        if stale >= 5:
+                            break
+                    else:
+                        stale = 0
+                        last_loc = curr
+                logger.info("go_to_start: clicked %d times, last_loc=%r", idx + 1, last_loc)
+
+            async def get_location() -> str:
+                """リーダー下部の "Location X of Y ● Z%" テキストを返す。
+                CSS で hidden にした要素でも textContent なら値が取れる。
+                これにより「本物の白紙ページ」と「ローディング中の白画面」を区別する。
+                """
+                try:
+                    txt = await page.evaluate(
+                        "() => {"
+                        "  const el = document.querySelector('.footer-label.position');"
+                        "  return el ? (el.textContent || '').trim() : '';"
+                        "}"
                     )
-                await page.keyboard.press("ArrowRight")
+                    return str(txt)
+                except Exception:  # noqa: BLE001
+                    return ""
+
+            async def wait_location_change(
+                prev: str, timeout_sec: float = 12.0
+            ) -> tuple[bool, str]:
+                """location が prev 以外になるまで待つ。(changed, new_location) を返す。"""
+                deadline = asyncio.get_event_loop().time() + timeout_sec
+                curr = prev
+                while asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(0.3)
+                    curr = await get_location()
+                    if curr and curr != prev:
+                        return True, curr
+                return False, curr
+
+            async def capture_stable() -> tuple[bytes, str]:
+                """現在の画面が変化しなくなるまで待ち、安定したスクショを返す。"""
+                prev: Optional[str] = None
+                stable = 0
+                last_png = b""
+                for _ in range(_MAX_STABLE_POLLS):
+                    await asyncio.sleep(_POLL_INTERVAL_SEC)
+                    png = await page.screenshot(type="png", clip=clip)
+                    h = hashlib.md5(png).hexdigest()
+                    if h == prev:
+                        stable += 1
+                        if stable >= _STABLE_SAMPLES:
+                            return png, h
+                    else:
+                        stable = 0
+                        prev = h
+                        last_png = png
+                # タイムアウト: 最後のサンプルを返す
+                return last_png, prev or ""
+
+            # 初回描画: Location が確定するまで少し待つ（描画完了を待つ）
+            await asyncio.sleep(2.0)
+            initial_location = await get_location()
+            logger.info("initial location=%r (will rewind to start)", initial_location)
+
+            # 先頭まで戻ってから計測開始
+            await go_to_start()
+            await asyncio.sleep(1.5)
+            prev_location = await get_location()
+            logger.info("location after rewind=%r", prev_location)
+
+            first_png, _ = await capture_stable()
+            images: list[Image.Image] = [
+                Image.open(io.BytesIO(first_png)).convert("RGB")
+            ]
+            yield PageEvent(
+                asin=asin, title=title, page=1, total=None, status="capturing"
+            )
+
+            for i in range(2, _MAX_PAGES + 1):
+                ok = await click_next_page()
+                if not ok:
+                    logger.info("click_next_page failed; treating as end of book")
+                    break
+                # Location が変わるまで待つ（=ローディングじゃなく本当に新しいページ）
+                changed, new_location = await wait_location_change(
+                    prev_location, timeout_sec=12.0
+                )
+                if not changed:
+                    logger.info(
+                        "Location unchanged after click (prev=%r new=%r); end of book",
+                        prev_location,
+                        new_location,
+                    )
+                    break
+                # Location は進んだが描画がまだの可能性があるのでハッシュ安定化
+                png, _ = await capture_stable()
+                images.append(Image.open(io.BytesIO(png)).convert("RGB"))
+                prev_location = new_location
+                yield PageEvent(
+                    asin=asin,
+                    title=title,
+                    page=len(images),
+                    total=None,
+                    status="capturing",
+                    message=new_location,
+                )
 
             if not images:
                 yield PageEvent(
