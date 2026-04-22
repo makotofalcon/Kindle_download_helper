@@ -73,6 +73,14 @@ class CaptureService:
                 return self._ctx
             settings.ensure_dirs()
             settings.CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            # 以前の異常終了で残った SingletonLock を掃除する（残っていると
+            # "Failed to create a ProcessSingleton" で launch できない）
+            for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+                stale = settings.CHROME_PROFILE_DIR / name
+                try:
+                    stale.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    pass
 
             self._pw = await async_playwright().start()
             # Kindle Cloud Reader は自動化検知がそれほど強くないため、
@@ -92,11 +100,13 @@ class CaptureService:
     async def fetch_library(self) -> list[BookItem]:
         """Cloud Reader の kindle-library ページから蔵書一覧をスクレイプする。
 
-        ページ上の DOM は頻繁に変わる可能性があるため、以下の手順で頑健に取得する:
-          1. library ページを開く
-          2. `asin` 属性や data-asin を持つ要素を全て列挙（カード/ボタンのどちらでも）
-          3. タイトルは同カード内の aria-label または子要素 text から推定
-          4. 遅延ロード対策として PageDown でスクロールしながら繰り返し走査
+        実際の DOM（2026-04 時点）:
+            <li id="library-item-option-{ASIN}" role="listitem">
+              <div id="title-{ASIN}"><p>...タイトル...</p></div>
+              <div id="author-{ASIN}"><p>...著者...</p></div>
+            </li>
+
+        仮想化されているので、End キーでスクロールして追加ロードを繰り返す。
         """
         ctx = await self._ensure_context()
         page = await ctx.new_page()
@@ -106,49 +116,49 @@ class CaptureService:
                 wait_until="domcontentloaded",
                 timeout=60_000,
             )
-            # library grid が出るまで待つ
             try:
                 await page.wait_for_selector(
-                    "[data-asin], [id^='cover-image-']", timeout=30_000
+                    "li[id^='library-item-option-']", timeout=30_000
                 )
-            except PWTimeoutError:
+            except PWTimeoutError as exc:
                 raise RuntimeError(
                     "蔵書ページの描画待ちでタイムアウト。Cloud Reader にログインしていますか？"
-                )
+                ) from exc
 
-            # 全件ロードのためスクロールして書籍数が増えなくなるまで繰り返す
+            # フォーカスを移してから End キーで末尾まで読み込む
+            await page.click("body")
             seen = 0
             stale = 0
-            for _ in range(60):
+            for _ in range(120):
                 count = await page.evaluate(
-                    "() => document.querySelectorAll('[data-asin]').length"
+                    "() => document.querySelectorAll(\"li[id^='library-item-option-']\").length"
                 )
                 if count == seen:
                     stale += 1
-                    if stale >= 3:
+                    if stale >= 4:
                         break
                 else:
                     stale = 0
                     seen = count
                 await page.keyboard.press("End")
-                await asyncio.sleep(0.6)
+                await asyncio.sleep(0.5)
 
             raw = await page.evaluate(
                 """() => {
                     const items = [];
-                    document.querySelectorAll('[data-asin]').forEach(el => {
-                        const asin = el.getAttribute('data-asin');
+                    document.querySelectorAll("li[id^='library-item-option-']").forEach(li => {
+                        const asin = li.id.replace(/^library-item-option-/, '');
                         if (!asin) return;
-                        // タイトルの候補を複数試す
-                        const aria = el.getAttribute('aria-label')
-                            || el.querySelector('[aria-label]')?.getAttribute('aria-label')
-                            || '';
-                        const titleEl = el.querySelector('[class*=title i], [data-testid*=title i]');
-                        const alt = el.querySelector('img')?.getAttribute('alt') || '';
-                        const title = (titleEl?.textContent || aria || alt || '').trim();
-                        items.push({ asin, title });
+                        const titleEl = li.querySelector(`#title-${asin} p`)
+                            || li.querySelector("[id^='title-'] p")
+                            || li.querySelector("p");
+                        const authorEl = li.querySelector(`#author-${asin} p`)
+                            || li.querySelector("[id^='author-'] p");
+                        const title = (titleEl?.textContent || '').trim();
+                        const authors = (authorEl?.textContent || '').trim();
+                        items.push({ asin, title, authors });
                     });
-                    // 重複排除 (asin で)
+                    // 重複排除
                     const seen = new Set();
                     return items.filter(i => {
                         if (seen.has(i.asin)) return false;
@@ -161,6 +171,7 @@ class CaptureService:
                 BookItem(
                     asin=str(item["asin"]),
                     title=str(item.get("title") or item["asin"]),
+                    authors=str(item.get("authors") or ""),
                 )
                 for item in raw
             ]
