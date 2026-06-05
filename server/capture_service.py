@@ -4,8 +4,11 @@
 設計ポイント:
   - Playwright の永続プロファイル (`CHROME_PROFILE_DIR`) を使い、初回だけユーザに
     手動ログイン（OTP を含む）してもらえば以降はセッションが持続する。
-  - ページ送りは keyboard `ArrowRight` を押して 0.8 秒待ち、スクショをハッシュ比較。
-    連続 3 回変化しなければ本の終端とみなして終了。
+  - リーダー下部の "Page/Location X of Y ● Z%" を構造化して進行・終端を判定する。
+    ページ送りはナビボタン（左右どちらの配置でも aria-label で特定）をクリックし、
+    クリック後に「current/percent が増える or 画面ハッシュが変わる」のを待ってから安定化。
+  - 終端は「Next ボタンが消える ＋ percent≧99/current≧total」が揃ったときのみ確定する。
+    単なる進行検知失敗を終端へ昇格しないことで、早期終了とページめくり失敗を防ぐ。
   - 出力: `OUTPUT_DIR/{サニタイズ済みタイトル}.pdf`
 """
 
@@ -33,26 +36,69 @@ from .schemas import BookItem
 
 logger = logging.getLogger(__name__)
 
-# 1 冊で想定される最大ページ数（暴走防止）
-_MAX_PAGES = 3000
+# 1 冊で想定される最大スクリーン数（暴走防止）
+_MAX_PAGES = 4000
 # ハッシュ安定化の 1 サンプルあたりの待ち時間（秒）
 _POLL_INTERVAL_SEC = 0.3
 # 連続して同ハッシュが続いたら "描画安定" と判定する回数
 _STABLE_SAMPLES = 4
-# 安定化待ちの最大試行数（実時間 = これ * POLL_INTERVAL_SEC）
-_MAX_STABLE_POLLS = 40  # 12 秒上限
-# "終端" 判定: 同じ安定ハッシュが続いた回数（ArrowRight でも変化しなかった）
-_END_REPEAT_THRESHOLD = 3
+# ページ送り後に「進行が起きるか」を待つ最大秒数（重い固定レイアウト本に余裕を持たせる）
+_ADVANCE_TIMEOUT_SEC = 25.0
+# 進行検知後、ハッシュが安定するまで待つ最大秒数
+_STABLE_TIMEOUT_SEC = 12.0
+# ページめくり失敗時のリトライ回数（フォールバック手段を順に試す）
+_TURN_RETRY_MAX = 4
+# 終端と見なすパーセンテージのしきい値
+_END_PERCENT = 99
 
-# キャプチャ領域: 画面上下の UI chrome (Kindle Library ボタン / Location バー) を除外
+# キャプチャ領域: 画面上下の UI chrome (Kindle Library ボタン / フッターの
+# 進捗シークバー) を除外。下端には読書進捗バー(seek bar)があるので広めに削る。
 _CROP_TOP = 50
-_CROP_BOTTOM_MARGIN = 50
+_CROP_BOTTOM_MARGIN = 78
 # 左右のナビ矢印ボタン (kr-chevron-*) は x=46-94 (prev) / x=1306-1354 (next) に固定
 # で width=48。余裕をみて 98px だけ除外すると、本文は幅広く保ちつつ矢印を確実に排除できる。
 _CROP_SIDE = 98
 _VIEWPORT_W = 1400
 _VIEWPORT_H = 1800
 
+# "Page 228 of 230 ● 100%" / "Location 51 of 220 ● 22%" の両形式を構造化する。
+_PROGRESS_RE = re.compile(
+    r"(Page|Location)\s+([\d,]+)\s+of\s+([\d,]+).*?(\d+)\s*%", re.IGNORECASE
+)
+
+
+@dataclass(frozen=True)
+class Progress:
+    """リーダー下部のフッターから読み取った進行状況。"""
+
+    unit: str  # "Page" or "Location"
+    current: int
+    total: int
+    percent: int
+    raw: str
+
+    @property
+    def at_end(self) -> bool:
+        return self.percent >= _END_PERCENT or self.current >= self.total
+
+
+def _parse_progress(text: str) -> Optional[Progress]:
+    """フッターテキストを Progress に変換。形式が合わなければ None。"""
+    if not text:
+        return None
+    m = _PROGRESS_RE.search(text)
+    if not m:
+        return None
+    try:
+        return Progress(
+            unit=m.group(1),
+            current=int(m.group(2).replace(",", "")),
+            total=int(m.group(3).replace(",", "")),
+            percent=int(m.group(4)),
+            raw=text.strip(),
+        )
+    except (ValueError, IndexError):
+        return None
 
 
 @dataclass
@@ -282,52 +328,25 @@ class CaptureService:
                 "height": _VIEWPORT_H - _CROP_TOP - _CROP_BOTTOM_MARGIN,
             }
 
-            async def click_next_page() -> bool:
-                """Playwright の実クリックで `aria-label="Next page"` ボタンを押す。
-                React の onClick は native click event で発火するので Playwright の
-                mouse pointer 経由クリックが確実。ボタンが消えていればタイムアウトして False。
-                """
+            # --- DOM 問い合わせヘルパ ------------------------------------
+            async def has_next() -> bool:
                 try:
-                    await page.locator(
-                        'button[aria-label="Next page"]'
-                    ).first.click(timeout=5_000)
-                    return True
+                    return await page.evaluate(
+                        "()=>document.querySelectorAll('button[aria-label=\"Next page\"]').length>0"
+                    )
                 except Exception:  # noqa: BLE001
                     return False
 
-            async def click_prev_page() -> bool:
+            async def has_prev() -> bool:
                 try:
-                    await page.locator(
-                        'button[aria-label="Previous page"]'
-                    ).first.click(timeout=5_000)
-                    return True
+                    return await page.evaluate(
+                        "()=>document.querySelectorAll('button[aria-label=\"Previous page\"]').length>0"
+                    )
                 except Exception:  # noqa: BLE001
                     return False
 
-            async def go_to_start(max_clicks: int = 600) -> None:
-                """Previous page ボタンを連打して先頭まで戻る。Location が変化しなくなったら終了。"""
-                last_loc = ""
-                stale = 0
-                for idx in range(max_clicks):
-                    ok = await click_prev_page()
-                    if not ok:
-                        break
-                    await asyncio.sleep(0.25)
-                    curr = await get_location()
-                    if curr == last_loc:
-                        stale += 1
-                        if stale >= 5:
-                            break
-                    else:
-                        stale = 0
-                        last_loc = curr
-                logger.info("go_to_start: clicked %d times, last_loc=%r", idx + 1, last_loc)
-
-            async def get_location() -> str:
-                """リーダー下部の "Location X of Y ● Z%" テキストを返す。
-                CSS で hidden にした要素でも textContent なら値が取れる。
-                これにより「本物の白紙ページ」と「ローディング中の白画面」を区別する。
-                """
+            async def read_progress() -> Optional[Progress]:
+                """フッターの "Page/Location X of Y ● Z%" を構造化して返す。"""
                 try:
                     txt = await page.evaluate(
                         "() => {"
@@ -335,120 +354,271 @@ class CaptureService:
                         "  return el ? (el.textContent || '').trim() : '';"
                         "}"
                     )
-                    return str(txt)
                 except Exception:  # noqa: BLE001
-                    return ""
+                    return None
+                return _parse_progress(str(txt))
 
-            async def wait_location_change(
-                prev: str, timeout_sec: float = 30.0
-            ) -> tuple[bool, str]:
-                """location が prev 以外の「非空な値」になるまで待つ。
-                遷移中に `.footer-label.position` が一時的に DOM から消えて
-                `''` を返すことがあるが、それはタイムアウトに数えず polling を継続する。
+            async def click_label(label: str, force: bool = False) -> bool:
+                """aria-label でナビボタンを Playwright 実クリック。
+
+                `force=True` は actionability チェック（特に hit-test）を飛ばす。
+                通常クリックが loader オーバーレイに横取りされて timeout する場合の
+                フォールバックに使う。
                 """
-                deadline = asyncio.get_event_loop().time() + timeout_sec
-                last_non_empty = prev
-                while asyncio.get_event_loop().time() < deadline:
-                    await asyncio.sleep(0.3)
-                    curr = await get_location()
-                    if not curr:
-                        # 遷移中の一時的消失。無視して再ポーリング。
-                        continue
-                    if curr != prev:
-                        return True, curr
-                    last_non_empty = curr
-                return False, last_non_empty
+                try:
+                    await page.locator(f'button[aria-label="{label}"]').first.click(
+                        timeout=4_000, force=force
+                    )
+                    return True
+                except Exception:  # noqa: BLE001
+                    return False
 
-            async def capture_stable() -> tuple[bytes, str]:
-                """現在の画面が変化しなくなるまで待ち、安定したスクショを返す。"""
-                prev: Optional[str] = None
+            async def loader_active() -> bool:
+                """ページ描画中に出る `.loader`/spinner が現在アクティブかを返す。
+
+                これがアクティブな間にナビボタンをクリックすると、loader が
+                pointer event を横取りしてページめくりが空振りする（ページめくり失敗の主因）。
+                """
+                try:
+                    return await page.evaluate(
+                        r"""() => {
+                            const ls = [...document.querySelectorAll(
+                                '.loader, [class*="loader" i], .kg-spinner, [class*="spinner" i]')];
+                            return ls.some(l => {
+                                const cs = getComputedStyle(l);
+                                return l.offsetParent !== null
+                                    && cs.display !== 'none'
+                                    && parseFloat(cs.opacity || '1') > 0.1
+                                    && l.getBoundingClientRect().width > 0;
+                            });
+                        }"""
+                    )
+                except Exception:  # noqa: BLE001
+                    return False
+
+            async def wait_loader_idle(timeout: float = 15.0) -> bool:
+                """loader/spinner が消えるまで待つ。クリック直前の描画完了ゲート。"""
+                deadline = asyncio.get_event_loop().time() + timeout
+                while asyncio.get_event_loop().time() < deadline:
+                    if not await loader_active():
+                        return True
+                    await asyncio.sleep(0.2)
+                return False
+
+            async def screenshot_hash() -> tuple[bytes, str]:
+                png = await page.screenshot(type="png", clip=clip)
+                return png, hashlib.md5(png).hexdigest()
+
+            # --- 先頭まで巻き戻す（current が下がるのを毎回待つ） ---------
+            async def go_to_start(max_clicks: int = 800) -> None:
+                pr = await read_progress()
+                last_current = pr.current if pr else None
+                stuck = 0
+                clicks = 0
+                for _ in range(max_clicks):
+                    pr = await read_progress()
+                    if pr and (pr.current <= 1 or pr.percent <= 0):
+                        break
+                    if not await has_prev():
+                        break
+                    await wait_loader_idle(timeout=8.0)
+                    if not await click_label("Previous page"):
+                        # 通常クリックが横取りされたら force で再試行
+                        await click_label("Previous page", force=True)
+                    clicks += 1
+                    # current が下がる（または先頭に到達する）のを最大 5 秒待つ
+                    moved = False
+                    deadline = asyncio.get_event_loop().time() + 5.0
+                    while asyncio.get_event_loop().time() < deadline:
+                        await asyncio.sleep(0.25)
+                        pr = await read_progress()
+                        if pr is None:
+                            continue
+                        if pr.current <= 1 or pr.percent <= 0:
+                            moved = True
+                            last_current = pr.current
+                            break
+                        if last_current is not None and pr.current < last_current:
+                            moved = True
+                            last_current = pr.current
+                            break
+                    if not moved:
+                        stuck += 1
+                        if stuck >= 4:
+                            break
+                    else:
+                        stuck = 0
+                final = await read_progress()
+                logger.info(
+                    "go_to_start: %d prev-clicks, final=%r", clicks, final.raw if final else None
+                )
+
+            # --- 現在画面のハッシュが安定するまで待ってスクショ ----------
+            async def settle_and_shot(
+                initial_hash: Optional[str] = None,
+            ) -> tuple[bytes, str]:
+                # 描画 loader が消えてからハッシュ安定化（スピナー混入を防ぐ）
+                await wait_loader_idle(timeout=_STABLE_TIMEOUT_SEC)
+                prev_h: Optional[str] = initial_hash
                 stable = 0
                 last_png = b""
-                for _ in range(_MAX_STABLE_POLLS):
+                deadline = asyncio.get_event_loop().time() + _STABLE_TIMEOUT_SEC
+                while asyncio.get_event_loop().time() < deadline:
                     await asyncio.sleep(_POLL_INTERVAL_SEC)
-                    png = await page.screenshot(type="png", clip=clip)
-                    h = hashlib.md5(png).hexdigest()
-                    if h == prev:
+                    png, h = await screenshot_hash()
+                    last_png = png
+                    if h == prev_h:
                         stable += 1
                         if stable >= _STABLE_SAMPLES:
                             return png, h
                     else:
-                        stable = 0
-                        prev = h
-                        last_png = png
-                # タイムアウト: 最後のサンプルを返す
-                return last_png, prev or ""
+                        stable = 1
+                        prev_h = h
+                return last_png, prev_h or ""
 
-            # 初回描画: Location が確定するまで少し待つ（描画完了を待つ）
+            # --- ページ送り 1 回ぶん。戻り値: ("advanced"|"end"|"stuck", png, hash, progress)
+            async def turn_and_capture(
+                prev_hash: str, prev_progress: Optional[Progress]
+            ) -> tuple[str, Optional[bytes], str, Optional[Progress]]:
+                # Next ボタンが無い＝終端候補。percent を見て本当の終端か確認。
+                if not await has_next():
+                    pr = await read_progress()
+                    if pr is None or pr.at_end:
+                        return "end", None, prev_hash, pr
+                    # 終端でないのに Next が無い＝一時的に消えている可能性。少し待って再確認。
+                    await asyncio.sleep(1.0)
+                    if not await has_next():
+                        pr2 = await read_progress()
+                        if pr2 and pr2.at_end:
+                            return "end", None, prev_hash, pr2
+                        # それでも無い＆終端でない → ページめくり手段なし。stuck 扱い。
+                        return "stuck", None, prev_hash, pr2 or pr
+
+                # ページめくり手段。ページめくり失敗の主因は「描画中(loader)に
+                # クリック→loader が pointer を横取り」なので、各試行前に loader が
+                # 消えるのを待ってからクリックする。Next ボタンの再クリックを基本とし、
+                # 2回目以降は force=True（hit-test 回避）。ArrowRight は最後の保険。
+                async def do_next(force: bool) -> None:
+                    await wait_loader_idle(timeout=12.0)
+                    ok = await click_label("Next page", force=force)
+                    if not ok:
+                        await click_label("Next page", force=True)
+
+                turn_methods = [
+                    lambda: do_next(False),
+                    lambda: do_next(True),
+                    lambda: do_next(True),
+                    lambda: page.keyboard.press("ArrowRight"),
+                ]
+                for attempt in range(_TURN_RETRY_MAX):
+                    method = turn_methods[min(attempt, len(turn_methods) - 1)]
+                    try:
+                        await method()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # 進行（hash変化 or current/percent増加）を待つ
+                    deadline = asyncio.get_event_loop().time() + _ADVANCE_TIMEOUT_SEC
+                    while asyncio.get_event_loop().time() < deadline:
+                        await asyncio.sleep(_POLL_INTERVAL_SEC)
+                        png, h = await screenshot_hash()
+                        pr = await read_progress()
+                        progressed = h != prev_hash
+                        if not progressed and pr and prev_progress:
+                            progressed = (
+                                pr.current > prev_progress.current
+                                or pr.percent > prev_progress.percent
+                            )
+                        if progressed:
+                            # 描画が安定するまで待つ
+                            spng, sh = await settle_and_shot(h)
+                            spr = await read_progress()
+                            return "advanced", spng, sh, spr or pr
+                    # この試行では進まなかった → 次のフォールバック手段へ
+                    logger.info(
+                        "turn attempt %d did not advance (prog=%r); retrying",
+                        attempt + 1,
+                        (await read_progress()),
+                    )
+                # 全リトライ尽きても進まず
+                pr = await read_progress()
+                if pr and pr.at_end:
+                    return "end", None, prev_hash, pr
+                return "stuck", None, prev_hash, pr
+
+            # === 本編 ===
             await asyncio.sleep(2.0)
-            initial_location = await get_location()
-            logger.info("initial location=%r (will rewind to start)", initial_location)
+            initial = await read_progress()
+            logger.info(
+                "initial progress=%r (will rewind to start)", initial.raw if initial else None
+            )
 
-            # 先頭まで戻ってから計測開始
             await go_to_start()
-            await asyncio.sleep(1.5)
-            prev_location = await get_location()
-            logger.info("location after rewind=%r", prev_location)
+            await asyncio.sleep(1.0)
 
-            first_png, first_hash = await capture_stable()
+            first_png, first_hash = await settle_and_shot()
             images: list[Image.Image] = [
                 Image.open(io.BytesIO(first_png)).convert("RGB")
             ]
             prev_hash = first_hash
+            prev_progress = await read_progress()
             yield PageEvent(
-                asin=asin, title=title, page=1, total=None, status="capturing"
+                asin=asin,
+                title=title,
+                page=1,
+                total=None,
+                status="capturing",
+                message=prev_progress.raw if prev_progress else None,
             )
 
-            # 終端判定: 「Location も hash も変わらない」が連続すれば終わり。
-            # `.footer-label.position` はページ遷移中に一時的に空になるため、Location
-            # だけでは誤検知しやすい。本が重いと Location 表示の反映が遅いので、
-            # hash 変化も併用することで確実にページ送りを検出する。
-            still_count = 0
-            for i in range(2, _MAX_PAGES + 1):
-                ok = await click_next_page()
-                if not ok:
-                    logger.info("click_next_page failed; treating as end of book")
+            ended_cleanly = False
+            for _ in range(2, _MAX_PAGES + 1):
+                outcome, png, new_hash, new_progress = await turn_and_capture(
+                    prev_hash, prev_progress
+                )
+                if outcome == "end":
+                    logger.info(
+                        "end of book reached (progress=%r)",
+                        new_progress.raw if new_progress else None,
+                    )
+                    ended_cleanly = True
+                    break
+                if outcome == "stuck":
+                    # 終端でないのにページめくりできなかった → 失敗として明示。
+                    logger.warning(
+                        "page turn stuck before end (progress=%r)",
+                        new_progress.raw if new_progress else None,
+                    )
+                    yield PageEvent(
+                        asin=asin,
+                        title=title,
+                        page=len(images),
+                        total=None,
+                        status="failed",
+                        message=(
+                            "ページめくりに失敗しました（終端ではありません）。"
+                            f" 進行={new_progress.raw if new_progress else '不明'}。"
+                            " 途中までの内容は保存します。"
+                        ),
+                    )
                     break
 
-                changed_loc, new_location = await wait_location_change(
-                    prev_location, timeout_sec=10.0
-                )
-                # いずれにせよ hash 安定化を待つ（本が重い本では Location 反映より
-                # 画面描画の方が早く終わるケースがある）
-                png, new_hash = await capture_stable()
-
-                if changed_loc and new_location:
-                    # Location が明らかに変わった = 新ページ確定
-                    advance_reason = f"loc {prev_location!r}->{new_location!r}"
-                    prev_location = new_location
-                elif new_hash != prev_hash:
-                    # Location 表示は追随してないが、画面は描画し直されている。
-                    # → 新ページと見なす
-                    advance_reason = f"hash changed ({prev_hash[:8]}->{new_hash[:8]}) while loc stayed"
-                else:
-                    # どちらも変わらず
-                    still_count += 1
-                    logger.info(
-                        "page did not advance (loc=%r hash unchanged, still_count=%d)",
-                        new_location,
-                        still_count,
-                    )
-                    if still_count >= _END_REPEAT_THRESHOLD:
-                        logger.info("end of book detected")
-                        break
-                    continue
-
-                still_count = 0
+                # advanced
+                if png is not None:
+                    images.append(Image.open(io.BytesIO(png)).convert("RGB"))
                 prev_hash = new_hash
-                images.append(Image.open(io.BytesIO(png)).convert("RGB"))
-                logger.info("captured page %d (%s)", len(images), advance_reason)
+                prev_progress = new_progress  # P1: 進行のたびに必ず更新
+                logger.info(
+                    "captured page %d (progress=%r)",
+                    len(images),
+                    new_progress.raw if new_progress else None,
+                )
                 yield PageEvent(
                     asin=asin,
                     title=title,
                     page=len(images),
                     total=None,
                     status="capturing",
-                    message=advance_reason,
+                    message=new_progress.raw if new_progress else None,
                 )
 
             if not images:
@@ -462,6 +632,9 @@ class CaptureService:
                 )
                 return
 
+            logger.info(
+                "capture finished: %d screens, ended_cleanly=%s", len(images), ended_cleanly
+            )
             yield PageEvent(
                 asin=asin,
                 title=title,
